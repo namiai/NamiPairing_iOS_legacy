@@ -3,18 +3,20 @@
 # migrate.sh — replace the NamiPairing_iOS Swift package repository with a
 # manifest-only copy whose binaries live on GitHub Releases.
 #
-# One run (PHASE=all) does, in order:
+# Phases:
 #
-#   prepare  1. mirror-clone the source repository into WORKDIR; the mirror is
-#               also the local backup,
+#   prepare  1. mirror-clone the source repository into WORKDIR (or refresh the
+#               mirror); the mirror is also the local backup,
 #            2. snapshot the source's settings, releases, collaborators, teams,
 #            3. build the thin history: one commit per tag in commit-date order,
 #               every *.xcframework removed, Package*.swift pointing at
 #               https://github.com/<source>/releases/download/<tag>/<name>.xcframework.zip
 #               with its sha256 checksum; author, message and dates of the
-#               original tag commit are preserved, other branches are dropped,
-#            4. create <source>_next with the source's settings, push main,
-#               the tags and this branch,
+#               original tag commit are preserved, other branches are dropped.
+#               The build is incremental: tags already built are kept and new
+#               tags are appended, so re-running after a release only adds it,
+#            4. create <source>_next with the source's settings (first run),
+#               push main, the tags and this branch,
 #            5. create one release per tag with its zip; a release that already
 #               exists on the source keeps its title and notes,
 #            6. copy collaborators and teams,
@@ -23,25 +25,26 @@
 #            9. verify the final name serves the thin tags and the newest asset
 #               downloads.
 #
-# Nothing before the swap is visible to consumers. The swap is the go-live.
-# Rollback is two renames; see ROLLBACK.md.
+# Intended use: PHASE=prepare early, PHASE=prepare again after every release
+# made on the source in the meantime (a sync, minutes), PHASE=all on migration
+# day (final sync, then the swap). Nothing before the swap is visible to
+# consumers. Rollback is two renames; see ROLLBACK.md.
 #
 # Environment:
 #   SOURCE_REPO   owner/name of the repository to replace (namiai/NamiPairing_iOS)
 #   SOURCE_URL    where to mirror-clone from; defaults to the GitHub SSH URL.
 #                 A local path works for rehearsals.
-#   WORKDIR       scratch and backup directory (./migration-work)
+#   WORKDIR       scratch and backup directory (./migration-work); every run
+#                 for one migration must use the same one
 #   PHASE         all | prepare | swap (all)
 #   BRANCH        name of this branch, pushed into the new repository
 #                 (migration/release-assets)
 #   TAG_FILTER    regex; only matching tags are migrated. Rehearsals only:
-#                 PHASE=swap and PHASE=all refuse a filter.
+#                 PHASE=swap and PHASE=all refuse a filter, and every run in a
+#                 workdir must use the same filter.
 #   DRY_RUN=1     print every GitHub write instead of performing it. The local
 #                 build still runs; verification that needs the new repository
 #                 is skipped.
-#   RESUME=1      keep a complete thin build and staged zips from a previous
-#                 run instead of rebuilding. Every GitHub step is idempotent
-#                 regardless, so re-running after an interruption continues.
 #
 # Requires bash 3.2+, git, gh (authenticated, admin on SOURCE_REPO), jq, ditto,
 # shasum, perl, curl.
@@ -61,7 +64,6 @@ PHASE="${PHASE:-all}"
 BRANCH="${BRANCH:-migration/release-assets}"
 TAG_FILTER="${TAG_FILTER:-}"
 DRY_RUN="${DRY_RUN:-0}"
-RESUME="${RESUME:-0}"
 
 RELEASE_BASE="https://github.com/${SOURCE_REPO}/releases/download"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -70,7 +72,7 @@ THIN="$WORKDIR/thin"
 ASSETS="$WORKDIR/assets"
 SNAP="$WORKDIR/snapshot"
 TAGS_FILE="$WORKDIR/tags.txt"
-COMMIT_MAP="$WORKDIR/commit-map.txt"
+COMMIT_MAP="$WORKDIR/commit-map.txt"   # "<source commit> <thin commit> <tag>"
 NEXT_MARKER="$WORKDIR/next-repo.id"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -120,6 +122,9 @@ release_state() {
   state=$(gh api "repos/$1/releases/tags/$2" --jq '"\(.draft) \(.assets | length)"' 2>/dev/null) || state=MISSING
   printf '%s' "$state"
 }
+
+# Tags are dotted numbers (1.4, 5.4.10); sort them as versions, not as text.
+version_sort() { sort -t. -k1,1n -k2,2n -k3,3n; }
 
 # ----------------------------------------------------------------------------
 # 1. Mirror the source (also the local backup)
@@ -171,7 +176,10 @@ collect_tags() {
   log "Selected $(wc -l < "$TAGS_FILE" | tr -d ' ') tags"
 }
 
-newest_tag() { tail -n1 "$TAGS_FILE" | awk '{print $3}'; }
+# The highest version among the selected tags: what main points at, what is
+# marked Latest, and what the end-to-end checks download. Not the newest by
+# date, so an out-of-order hotfix never takes over.
+highest_tag() { awk '{print $3}' "$TAGS_FILE" | version_sort | tail -n1; }
 
 # Swap every local xcframework path in a manifest for a URL + checksum.
 #   $1 file  $2 xcframework basename without extension  $3 url  $4 checksum
@@ -195,95 +203,132 @@ commit_as() {
     git -C "$THIN" commit -q --allow-empty-message -m "$message"
 }
 
-build_thin() {
-  local built staged
-  if [ "$RESUME" = "1" ] && [ -d "$THIN/.git" ]; then
-    built=$(git -C "$THIN" tag | wc -l | tr -d ' ')
-    staged=$(find "$ASSETS" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$built" = "$(wc -l < "$TAGS_FILE" | tr -d ' ')" ] && [ "$staged" = "$built" ]; then
-      log "RESUME: thin repository ($built tags) and staged zips are complete; skipping build"
-      return 0
-    fi
-    warn "RESUME: build incomplete (tags=$built zips=$staged); rebuilding"
+# Stage the tag's tree in $THIN with its xcframeworks zipped into $ASSETS/<tag>
+# and the manifests rewritten.
+stage_tag_tree() {
+  local tag="$1" sums_file xcf base zip sum name manifest
+  find "$THIN" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+  git -C "$SRC" archive "$tag" | tar -x -C "$THIN"
+  rm -rf "$ASSETS/$tag"
+  mkdir -p "$ASSETS/$tag"
+  sums_file="$ASSETS/$tag/.checksums"
+  : > "$sums_file"
+
+  if find "$THIN" -type d -name '*.xcframework' | grep -q .; then
+    find "$THIN" -type d -name '*.xcframework' | sort | while read -r xcf; do
+      base=$(basename "$xcf")
+      zip="$ASSETS/$tag/${base}.zip"
+      # --keepParent: SwiftPM wants the .xcframework directory at the top of
+      # the archive. No --sequesterRsrc: extended attributes stay out of the
+      # zip, so the checksum depends on the framework alone.
+      (cd "$(dirname "$xcf")" && ditto -c -k --keepParent "$base" "$zip")
+      sum=$(shasum -a 256 "$zip" | awk '{print $1}')
+      printf '%s %s\n' "${base%.xcframework}" "$sum" >> "$sums_file"
+      log "  $base -> $(du -h "$zip" | awk '{print $1}') sha256 ${sum:0:12}…"
+      rm -rf "$xcf"
+    done
+    while read -r name sum; do
+      for manifest in "$THIN"/Package*.swift; do
+        [ -f "$manifest" ] || continue
+        rewrite_manifest "$manifest" "$name" "$RELEASE_BASE/$tag/${name}.xcframework.zip" "$sum"
+      done
+    done < "$sums_file"
+  elif grep -q "$RELEASE_BASE/$tag/" "$THIN/Package.swift" 2>/dev/null; then
+    # Already asset-backed (released by the new CI): keep the manifests,
+    # re-host the assets.
+    log "  already asset-backed; downloading its release assets from $SOURCE_REPO"
+    gh release download "$tag" --repo "$SOURCE_REPO" --pattern '*.xcframework.zip' \
+      --dir "$ASSETS/$tag" --clobber </dev/null
+  else
+    die "tag $tag has no xcframework and no asset-backed manifest"
   fi
 
-  log "Building thin repository at $THIN"
-  rm -rf "$THIN" "$ASSETS"
-  mkdir -p "$THIN" "$ASSETS"
-  git -C "$THIN" init -q -b main
-  : > "$COMMIT_MAP"
+  if grep -REIn 'path:[[:space:]]*"[^"]*\.xcframework"' "$THIN"/Package*.swift 2>/dev/null; then
+    die "tag $tag: a manifest still references a local xcframework (see above)"
+  fi
+  find "$ASSETS/$tag" -name '*.zip' | grep -q . || die "tag $tag: no zip staged"
+}
 
-  local when commit tag reused xcf base name zip sum thin_commit sums_file
+build_thin() {
+  local when commit tag existing mapped reused parent thin_commit newest_built src_commit
+  mkdir -p "$ASSETS"
+  if [ ! -d "$THIN/.git" ]; then
+    log "Creating thin repository at $THIN"
+    git init -q -b main "$THIN"
+    : > "$COMMIT_MAP"
+  fi
+
+  # The chain is append-only. A tag older than one already built would have
+  # to be inserted, which rewrites every commit after it and moves tags that
+  # may already be on the new repository.
+  newest_built=0
+  while read -r src_commit thin_commit tag; do
+    when=$(git -C "$SRC" log -1 --format=%ct "$src_commit")
+    [ "$when" -gt "$newest_built" ] && newest_built=$when
+  done < "$COMMIT_MAP"
+
+  parent=""
   while read -r when commit tag; do
-    reused=$(awk -v c="$commit" '$1 == c { print $2 }' "$COMMIT_MAP")
-    if [ -n "$reused" ]; then
-      git -C "$THIN" tag -f "$tag" "$reused" >/dev/null
-      log "tag $tag -> same commit as an earlier tag, reused ${reused:0:8}"
+    existing=$(git -C "$THIN" rev-parse -q --verify "refs/tags/$tag^{commit}" || true)
+    if [ -n "$existing" ]; then
+      mapped=$(awk -v t="$tag" '$3 == t { print $1; exit }' "$COMMIT_MAP")
+      [ "$mapped" = "$commit" ] \
+        || die "tag $tag was built from ${mapped:0:8} but now points at ${commit:0:8}; a moved tag cannot be synced"
+      [ -d "$ASSETS/$tag" ] \
+        || die "tag $tag is built but $ASSETS/$tag is missing; delete $THIN and $ASSETS to rebuild"
+      parent="$existing"
       continue
     fi
 
+    reused=$(awk -v c="$commit" '$1 == c { print $2; exit }' "$COMMIT_MAP")
+    if [ -n "$reused" ]; then
+      git -C "$THIN" tag -f "$tag" "$reused" >/dev/null
+      printf '%s %s %s\n' "$commit" "$reused" "$tag" >> "$COMMIT_MAP"
+      log "tag $tag -> same source commit as an earlier tag, reused ${reused:0:8}"
+      parent="$reused"
+      continue
+    fi
+
+    [ "$when" -ge "$newest_built" ] \
+      || die "tag $tag (source ${commit:0:8}) is older than tags already built; delete $THIN and $ASSETS to rebuild from scratch"
+
     log "tag $tag (source ${commit:0:8})"
-    find "$THIN" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-    git -C "$SRC" archive "$tag" | tar -x -C "$THIN"
-    mkdir -p "$ASSETS/$tag"
-    sums_file="$ASSETS/$tag/.checksums"
-    : > "$sums_file"
-
-    if find "$THIN" -type d -name '*.xcframework' | grep -q .; then
-      # Normal case: zip each xcframework, record its checksum, drop it.
-      find "$THIN" -type d -name '*.xcframework' | sort | while read -r xcf; do
-        base=$(basename "$xcf")
-        zip="$ASSETS/$tag/${base}.zip"
-        # --keepParent: SwiftPM wants the .xcframework directory at the top of
-        # the archive. No --sequesterRsrc: extended attributes stay out of the
-        # zip, so the checksum depends on the framework alone.
-        (cd "$(dirname "$xcf")" && ditto -c -k --keepParent "$base" "$zip")
-        sum=$(shasum -a 256 "$zip" | awk '{print $1}')
-        printf '%s %s\n' "${base%.xcframework}" "$sum" >> "$sums_file"
-        log "  $base -> $(du -h "$zip" | awk '{print $1}') sha256 ${sum:0:12}…"
-        rm -rf "$xcf"
-      done
-      while read -r name sum; do
-        for manifest in "$THIN"/Package*.swift; do
-          [ -f "$manifest" ] || continue
-          rewrite_manifest "$manifest" "$name" "$RELEASE_BASE/$tag/${name}.xcframework.zip" "$sum"
-        done
-      done < "$sums_file"
-    elif grep -q "$RELEASE_BASE/$tag/" "$THIN/Package.swift" 2>/dev/null; then
-      # The tag is already asset-backed (released by the new CI after the
-      # cut-over tooling landed): keep its manifests, re-host its assets.
-      log "  already asset-backed; downloading its release assets from $SOURCE_REPO"
-      gh release download "$tag" --repo "$SOURCE_REPO" --pattern '*.xcframework.zip' \
-        --dir "$ASSETS/$tag" --clobber </dev/null
-    else
-      die "tag $tag has no xcframework and no asset-backed manifest"
+    if [ -n "$parent" ]; then
+      git -C "$THIN" checkout -q --detach "$parent"
     fi
-
-    if grep -REIn 'path:[[:space:]]*"[^"]*\.xcframework"' "$THIN"/Package*.swift 2>/dev/null; then
-      die "tag $tag: a manifest still references a local xcframework (see above)"
-    fi
-    find "$ASSETS/$tag" -name '*.zip' | grep -q . || die "tag $tag: no zip staged"
-
+    stage_tag_tree "$tag"
     git -C "$THIN" add -A
     commit_as "$commit"
     thin_commit=$(git -C "$THIN" rev-parse HEAD)
-    printf '%s %s\n' "$commit" "$thin_commit" >> "$COMMIT_MAP"
+    printf '%s %s %s\n' "$commit" "$thin_commit" "$tag" >> "$COMMIT_MAP"
     git -C "$THIN" tag -f "$tag" "$thin_commit" >/dev/null
+    parent="$thin_commit"
   done < "$TAGS_FILE"
 
-  log "Thin history: $(git -C "$THIN" rev-list --count main) commits, $(git -C "$THIN" tag | wc -l | tr -d ' ') tags, .git $(du -sh "$THIN/.git" | awk '{print $1}'); zips $(du -sh "$ASSETS" | awk '{print $1}')"
+  git -C "$THIN" checkout -q --detach
+  git -C "$THIN" branch -f main "refs/tags/$(highest_tag)^{commit}"
+  git -C "$THIN" checkout -q main
+  log "Thin history: $(git -C "$THIN" tag | wc -l | tr -d ' ') tags, main at $(highest_tag), .git $(du -sh "$THIN/.git" | awk '{print $1}'); zips $(du -sh "$ASSETS" | awk '{print $1}')"
 }
 
 # This branch travels with the new repository so the tooling stays findable.
+# Commits only when the files changed, so a re-run pushes nothing new.
 add_tooling_branch() {
-  log "Adding $BRANCH (this tooling) to the thin repository"
-  git -C "$THIN" branch -D "$BRANCH" >/dev/null 2>&1 || true
-  git -C "$THIN" checkout -q --orphan "$BRANCH"
-  git -C "$THIN" rm -rfq --cached . >/dev/null 2>&1 || true
+  log "Updating $BRANCH (this tooling) in the thin repository"
+  if git -C "$THIN" rev-parse -q --verify "refs/heads/$BRANCH" >/dev/null; then
+    git -C "$THIN" checkout -q "$BRANCH"
+  else
+    git -C "$THIN" checkout -q --orphan "$BRANCH"
+    git -C "$THIN" rm -rfq --cached . >/dev/null 2>&1 || true
+  fi
   find "$THIN" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
   cp "$SCRIPT_DIR/migrate.sh" "$SCRIPT_DIR/README.md" "$SCRIPT_DIR/ROLLBACK.md" "$THIN/"
   git -C "$THIN" add -A
-  git -C "$THIN" commit -q -m "Repository migration tooling"
+  if git -C "$THIN" rev-parse -q --verify HEAD >/dev/null && git -C "$THIN" diff --cached --quiet; then
+    log "  unchanged"
+  else
+    git -C "$THIN" commit -q -m "Repository migration tooling"
+  fi
   git -C "$THIN" checkout -q main
 }
 
@@ -325,7 +370,9 @@ push_next_repo() {
   git -C "$THIN" remote remove next >/dev/null 2>&1 || true
   git -C "$THIN" remote add next "git@github.com:${NEXT_REPO}.git"
   # main first and on its own, so it is the first branch GitHub sees; the
-  # default branch is then pinned explicitly rather than inferred.
+  # default branch is then pinned explicitly rather than inferred. Tags that
+  # already exist on the remote are unchanged by construction; git refuses a
+  # moved one, which is the right outcome.
   run git -C "$THIN" push -q next main
   run gh api -X PATCH "repos/$NEXT_REPO" -f default_branch=main --silent
   run git -C "$THIN" push -q next "$BRANCH"
@@ -361,7 +408,7 @@ create_releases() {
       log "Release $tag: create with $expected asset(s)"
       new=$((new + 1))
       # --latest=false keeps GitHub from marking each historical release as
-      # latest while the loop runs; the newest tag is marked at the end.
+      # latest while the loop runs; the highest version is marked at the end.
       run gh release create "$tag" "${zips[@]}" --repo "$NEXT_REPO" \
         --title "$title" --notes-file "$notes_file" --verify-tag --latest=false
     else
@@ -372,8 +419,8 @@ create_releases() {
     fi
   done < "$TAGS_FILE"
   shopt -u nullglob
-  log "Releases: already-ok=$ok created=$new fixed=$fixed; marking $(newest_tag) as latest"
-  run gh release edit "$(newest_tag)" --repo "$NEXT_REPO" --latest
+  log "Releases: already-ok=$ok created=$new fixed=$fixed; marking $(highest_tag) as latest"
+  run gh release edit "$(highest_tag)" --repo "$NEXT_REPO" --latest
 }
 
 # ----------------------------------------------------------------------------
@@ -406,7 +453,7 @@ manifest_checksum() {  # $1 tag; the checksum our own manifest records for the t
 }
 
 verify_next_repo() {
-  local repo="$1" tag remote_tags local_tags missing draft_or_empty tmp sum
+  local repo="$1" tag remote_tags local_tags missing draft_or_empty tmp sum when commit
   if [ "$DRY_RUN" = "1" ]; then
     warn "DRY_RUN=1: skipping verification of $repo"
     return 0
@@ -425,7 +472,7 @@ verify_next_repo() {
   done < "$TAGS_FILE"
   [ "$missing" = "0" ] && [ "$draft_or_empty" = "0" ] || die "releases on $repo are incomplete"
 
-  tag=$(newest_tag)
+  tag=$(highest_tag)
   tmp=$(mktemp -d)
   gh release download "$tag" --repo "$repo" --pattern '*.xcframework.zip' --dir "$tmp" </dev/null
   sum=$(shasum -a 256 "$tmp"/*.xcframework.zip | head -n1 | awk '{print $1}')
@@ -467,7 +514,7 @@ verify_live() {
     warn "DRY_RUN=1: skipping live verification"
     return 0
   fi
-  tag=$(newest_tag)
+  tag=$(highest_tag)
   url="$RELEASE_BASE/$tag/$(basename "$(ls "$ASSETS/$tag"/*.xcframework.zip | head -n1)")"
   log "Verifying $SOURCE_REPO serves tag $tag and $url"
   for attempt in 1 2 3 4 5 6; do
