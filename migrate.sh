@@ -239,6 +239,13 @@ stage_tag_tree() {
     log "  already asset-backed; downloading its release assets from $SOURCE_REPO"
     gh release download "$tag" --repo "$SOURCE_REPO" --pattern '*.xcframework.zip' \
       --dir "$ASSETS/$tag" --clobber </dev/null
+    # Re-host only bytes the manifest actually describes.
+    for zip in "$ASSETS/$tag"/*.xcframework.zip; do
+      [ -f "$zip" ] || die "tag $tag: no asset downloaded from $SOURCE_REPO"
+      sum=$(shasum -a 256 "$zip" | awk '{print $1}')
+      grep -q "checksum: \"$sum\"" "$THIN/Package.swift" \
+        || die "tag $tag: hosted $(basename "$zip") is sha256 ${sum:0:12}… but its manifest records a different checksum; the source release is inconsistent"
+    done
   else
     die "tag $tag has no xcframework and no asset-backed manifest"
   fi
@@ -448,8 +455,18 @@ copy_access() {
 # ----------------------------------------------------------------------------
 # 7. Verification of the prepared repository
 # ----------------------------------------------------------------------------
-manifest_checksum() {  # $1 tag; the checksum our own manifest records for the tag
-  git -C "$THIN" show "$1:Package.swift" | grep -o 'checksum: "[0-9a-f]*"' | head -n1 | cut -d'"' -f2
+manifest_checksum() {  # $1 tag $2 asset file name; the checksum the manifest records for that asset
+  git -C "$THIN" show "$1:Package.swift" | tr -d '\n' \
+    | grep -o "url: \"[^\"]*/$2\",[[:space:]]*checksum: \"[0-9a-f]*\"" | head -n1 | grep -o '[0-9a-f]\{64\}'
+}
+
+download_and_hash() {  # $1 repo $2 tag $3 asset file name; sha256 of the served bytes
+  local tmp sum
+  tmp=$(mktemp -d)
+  gh release download "$2" --repo "$1" --pattern "$3" --dir "$tmp" </dev/null
+  sum=$(shasum -a 256 "$tmp/$3" | awk '{print $1}')
+  rm -rf "$tmp"
+  printf '%s' "$sum"
 }
 
 verify_next_repo() {
@@ -472,13 +489,26 @@ verify_next_repo() {
   done < "$TAGS_FILE"
   [ "$missing" = "0" ] && [ "$draft_or_empty" = "0" ] || die "releases on $repo are incomplete"
 
-  tag=$(highest_tag)
-  tmp=$(mktemp -d)
-  gh release download "$tag" --repo "$repo" --pattern '*.xcframework.zip' --dir "$tmp" </dev/null
-  sum=$(shasum -a 256 "$tmp"/*.xcframework.zip | head -n1 | awk '{print $1}')
-  rm -rf "$tmp"
-  [ "$sum" = "$(manifest_checksum "$tag")" ] || die "checksum of the $tag asset on $repo does not match its manifest"
-  log "  $(wc -l < "$TAGS_FILE" | tr -d ' ') tags, all releases published with assets, $tag checksum matches"
+  # Every asset's sha256 (GitHub's digest, or a download when GitHub has
+  # none) must be the checksum its manifest records, otherwise SwiftPM
+  # rejects the download. The highest version is downloaded regardless, to
+  # prove the served bytes.
+  local asset digest expected mismatched=0
+  while read -r when commit tag; do
+    while read -r asset digest; do
+      [ -n "$asset" ] || continue
+      if [ "$digest" = "null" ] || [ "$tag" = "$(highest_tag)" ]; then
+        digest="sha256:$(download_and_hash "$repo" "$tag" "$asset")"
+      fi
+      expected=$(manifest_checksum "$tag" "$asset")
+      if [ "$digest" != "sha256:$expected" ]; then
+        mismatched=$((mismatched + 1))
+        warn "release $tag: $asset is $digest, its manifest records ${expected:-nothing}"
+      fi
+    done < <(gh api "repos/$repo/releases/tags/$tag" --jq '.assets[] | "\(.name) \(.digest)"')
+  done < "$TAGS_FILE"
+  [ "$mismatched" = "0" ] || die "$mismatched asset(s) on $repo do not match their manifests"
+  log "  $(wc -l < "$TAGS_FILE" | tr -d ' ') tags, all releases published, every asset matches its manifest"
 }
 
 # ----------------------------------------------------------------------------
